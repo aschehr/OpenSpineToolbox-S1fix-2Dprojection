@@ -19,6 +19,9 @@ sdlc_protocol board ...":
          workers, .github/symphony/workers/<name>.json, read offline
   guard  the PreToolUse hook: the tool call's JSON on stdin, and exit 2
          with the reason on stderr to refuse a push
+  locks  status, plan, acquire, release, sweep, verify or overlap: the locks on
+         files, symbols and named resources in LOCKS.json on the branch
+         locks; verify obeys the switch SYMPHONY_LOCKS, off by default
   verify-vendored VENDOR_DIR
          hold a vendored copy, VENDOR_DIR/sdlc_protocol, to the record
          VENDOR_DIR/VENDORED beside it (vendoring.py, which a copy also
@@ -36,6 +39,7 @@ time of urllib is no use to it.
 import argparse
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,7 +47,7 @@ from pathlib import Path
 from . import board, claims, guard, protocol_check, team, vendoring, workers
 
 PROG = "python3 -m sdlc_protocol"
-USAGE = (f"usage: {PROG} {{board,check,team,workers,guard,verify-vendored}} [arguments]; "
+USAGE = (f"usage: {PROG} {{board,check,team,workers,guard,locks,verify-vendored}} [arguments]; "
          f"{PROG} <command> -h says more")
 
 
@@ -113,7 +117,8 @@ def plan_board(api, sha, default_branch, now, render_only=False, say=print, star
     dated at the run's start (adapters.github.head_since)."""
     github = github_adapter()
     snap = github.snapshot(api, sha, default_branch, now, started_by)
-    for line in github.unread_claim_lines(snap) + github.pushed_refused_lines(snap) + github.began_refused_lines(snap):
+    for line in (github.unread_claim_lines(snap) + github.pushed_refused_lines(snap)
+                 + github.began_refused_lines(snap) + github.dependencies_skipped_lines(snap)):
         say(line)
     if not render_only:
         for line in github.coordinate(api, snap, now):
@@ -123,13 +128,16 @@ def plan_board(api, sha, default_branch, now, render_only=False, say=print, star
 
 def act_on_board(api, snap, event_name, ref_name, now, say=print):
     """The second half, once the page is written: rename the released
-    claims' branches, then post the comments the pull requests are owed,
-    both from the snapshot the first half read; the event and the ref are
-    passed on, though since F12's fix no comment depends on them."""
+    claims' branches, post the comments the pull requests are owed, and
+    write each open epic's flowchart into its body, all from the snapshot
+    the first half read; the event and the ref are passed on, though
+    since F12's fix no comment depends on them."""
     github = github_adapter()
     for line in github.release_claims(api, snap):
         say(line)
     for line in github.post_comments(api, board.comments_due(snap, event_name, ref_name, now)):
+        say(line)
+    for line in github.write_graphs(api, snap, board.epic_blocks(snap)):
         say(line)
 
 
@@ -184,19 +192,38 @@ def pushed_branch(environ):
     return ref if isinstance(ref, str) else ""
 
 
+def say_what_it_cost(api):
+    """The board run's last line (adapters.github.calls_line), which never
+    takes the place of the run's own outcome: a client that keeps no count,
+    or keeps one in another shape, as a stand-in may, or a time no clock
+    writes, says nothing."""
+    try:
+        print(github_adapter().calls_line(api))
+    except (AttributeError, LookupError, TypeError, ValueError, OverflowError, OSError):
+        return
+
+
 def board_live_run(args, environ):
+    """A board run on GitHub: the two halves, the page written between
+    them, and last, whether the run ended or GitHub refused it on the way,
+    the calls GitHub answered and what the token had left (say_what_it_cost),
+    the one figure of what a board run costs taken in the repository
+    itself."""
     token, repo = environ.get("GITHUB_TOKEN"), environ.get("GITHUB_REPOSITORY")
     if not token or not repo:
         raise CommandError("GITHUB_TOKEN and GITHUB_REPOSITORY must be set")
     api = github_adapter().GitHub(token, repo)
     now = datetime.now(timezone.utc)
-    snap, page = plan_board(api, args.sha or default_head_sha(environ, args.default_branch), args.default_branch,
-                            now, args.render_only, started_by=pushed_branch(environ))
-    out = Path(args.out) if args.out else board.STATE_PATH
-    changed = board.write_if_changed(out, page)
-    print(f"{out.as_posix()}: {'rewritten' if changed else 'unchanged'}")
-    if not args.render_only:
-        act_on_board(api, snap, environ.get("GITHUB_EVENT_NAME", ""), environ.get("GITHUB_REF_NAME", ""), now)
+    try:
+        snap, page = plan_board(api, args.sha or default_head_sha(environ, args.default_branch), args.default_branch,
+                                now, args.render_only, started_by=pushed_branch(environ))
+        out = Path(args.out) if args.out else board.STATE_PATH
+        changed = board.write_if_changed(out, page)
+        print(f"{out.as_posix()}: {'rewritten' if changed else 'unchanged'}")
+        if not args.render_only:
+            act_on_board(api, snap, environ.get("GITHUB_EVENT_NAME", ""), environ.get("GITHUB_REF_NAME", ""), now)
+    finally:
+        say_what_it_cost(api)
     return 0
 
 
@@ -226,10 +253,223 @@ def read_event(environ):
     return event, ""
 
 
+# How long one git call of the check may take: a fetch is of a few
+# commits' objects, or of the history down to a merge base.
+GIT_SECONDS = 120
+# What git is run with whatever the environment or the checkout's own
+# configuration say: no automatic housekeeping, and pathspecs read with
+# their magic, never literally (F31's second review).
+GIT_SETTINGS = ("--no-literal-pathspecs", "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+                "-c", "diff.ignoreSubmodules=none")
+UNREAD = "the claim files this pull request changes could not be read: "
+# How far a shallow clone is deepened, in turn, to find where a pull
+# request's branch left its base; the last step takes the whole history.
+DEEPENINGS = (("--deepen=64",), ("--deepen=512",), ("--unshallow",))
+# How much of git's last words a reason quotes.
+STDERR_TAIL = 200
+
+
+class Git:
+    """git run in one checkout, with every GIT_* variable of the
+    environment left out, since an earlier step of the job can set any of
+    them through $GITHUB_ENV (GIT_LITERAL_PATHSPECS, which empties the
+    diff, GIT_DIR, which reads another repository, GIT_CONFIG_*), and the
+    last failure's words kept for the reason the check gives."""
+
+    def __init__(self, root):
+        self.root = root
+        self.environ = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+        self.why = ""
+
+    def __call__(self, *args):
+        """git's standard output, or None, with why saying what went
+        wrong: git missing, a timeout, or the tail of what git wrote to
+        its standard error."""
+        try:
+            done = subprocess.run(["git", *GIT_SETTINGS, *args], cwd=self.root, env=self.environ,
+                                  capture_output=True, timeout=GIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            self.why = f"git {args[0]} timed out after {GIT_SECONDS} s"
+            return None
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            self.why = f"git could not be run ({error.__class__.__name__})"
+            return None
+        if done.returncode != 0:
+            self.why = f"git {args[0]} failed: {last_words(done.stderr)}"
+            return None
+        return done.stdout
+
+    def said(self, what):
+        """A reason, with git's own last words where it gave any."""
+        return f"{what} ({self.why})" if self.why else what
+
+
+def last_words(stderr):
+    """The last line git wrote to its standard error, as plain ASCII of
+    bounded length, or how it ended where it wrote nothing."""
+    lines = [line.strip() for line in stderr.decode("utf-8", "replace").splitlines() if line.strip()]
+    text = (lines[-1] if lines else "no message").encode("ascii", "replace").decode("ascii")
+    return text[:STDERR_TAIL]
+
+
+def event_sha(side):
+    """A commit an event's head or base names, or None where it names
+    none git could take as one."""
+    sha = (side or {}).get("sha")
+    return sha if isinstance(sha, str) and 7 <= len(sha) <= 64 and sha.isascii() and sha.isalnum() else None
+
+
+def parents_of(git, commit):
+    """The parents a commit's own object names, which a clone of depth 1
+    still holds where commit^1 is not there; None where git cannot read
+    it."""
+    text = git("cat-file", "commit", commit)
+    if text is None:
+        return None
+    return [line.split()[1] for line in text.decode("ascii", "replace").splitlines()
+            if line.startswith("parent ") and len(line.split()) == 2]
+
+
+def fetched(git, sha):
+    """Whether the commit is in the clone, fetched one deep from origin
+    where it was not, as actions/checkout's default depth of 1 leaves it
+    out; origin is the base repository, which holds a fork's head too."""
+    if git("cat-file", "-e", f"{sha}^{{commit}}") is not None:
+        return True
+    if git("fetch", "--quiet", "--no-tags", "--depth=1", "origin", sha) is None:
+        return False
+    return git("cat-file", "-e", f"{sha}^{{commit}}") is not None
+
+
+def merge_bases(git, one, two):
+    """Every commit where the branch at two left one, git's merge bases
+    (`merge-base --all`, so criss-cross history, which has several, hides
+    nothing behind the one git would pick), deepening a shallow clone step
+    by step until git finds one; () where it never does, which the check
+    fails on rather than guess. one and two are shas, so a deepening
+    fetches the pull request's own commits."""
+    for deepening in ((),) + DEEPENINGS:
+        if deepening:
+            shallow = git("rev-parse", "--is-shallow-repository")
+            if shallow is None or shallow.strip() != b"true":
+                return ()
+            git("fetch", "--quiet", "--no-tags", *deepening, "origin", one, two)
+        found = git("merge-base", "--all", one, two)
+        if found is not None and found.split():
+            return tuple(line.decode("ascii", "replace") for line in found.split())
+    return ()
+
+
+def checkout_of(git, pull, base):
+    """What the checkout is: the commit whose change is the pull request's
+    own, the commit GitHub's test merge was made on where HEAD is that
+    merge, and whether HEAD is the pull request at all. HEAD is the test
+    merge where it is a merge whose second parent is the head the event
+    names, whatever its first: GitHub makes the merge on the base branch
+    as it stands when the event fires, while the event's base is a commit
+    it set when the pull request was opened and leaves while the base
+    branch alone moves (symphony-template#315's pushes while behind main
+    carried the base it was opened on), so the two agree only while the
+    base has not moved past the pull request, which GitHub's rule that a
+    branch be up to date no longer prevents; such a pull request is the
+    test merge by its second parent alone, and its first parent is what
+    the merge was made on, the merge's own change being read against it.
+    Where the
+    event names no head, HEAD is the test merge where it is a merge whose
+    first parent is the base. The tip is the event's head wherever it
+    names one, so a checkout of something else, the base as
+    pull_request_target leaves it among them, still has the pull request's
+    own change judged; and where the event names none, HEAD itself, as a
+    sha, a head commit that is itself a merge among them. None for the tip
+    where git cannot read HEAD."""
+    here = git("rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    parents = parents_of(git, "HEAD") if here is not None else None
+    if parents is None:
+        return None, None, False
+    here = here.decode("ascii", "replace").strip()
+    head = event_sha(pull.get("head"))
+    test_merge = len(parents) == 2 and (parents[1] == head if head is not None else parents[0] == base)
+    made_on = parents[0] if test_merge else None
+    tip = parents[1] if test_merge else (head or here)
+    return tip, made_on, test_merge or head is None or here == head
+
+
+def change_of(git, pull):
+    """The diffs a pull request's change is judged by, read with git from
+    the checkout the check runs in, over every path, since a path that
+    folds into the claim folder may be spelt in letters git's own icase
+    pathspec does not fold (F31's second review), or why they could not
+    be read: the
+    branch's own change, from each commit where it left the base to its
+    tip (git's three dots, from every merge base), so a file the base
+    also holds, which the merge leaves alone, still counts where the
+    branch added it; and, in GitHub's test merge, the merge's change
+    against the commit it was made on, its first parent, as well, which
+    is the base branch's tip when the event fired and not the event's
+    base, a commit the base branch may have moved past, so that what the
+    base branch did since is never read as the pull request's; the diffs
+    from every merge base already hold whatever the merge brings, so that
+    second reading is a second reading of the same change, never the only
+    one. A checkout that is neither
+    the test merge nor the event's head is no reading of the pull
+    request's claim file, so it is a reason too, beside the change
+    judged."""
+    base = event_sha(pull.get("base"))
+    if base is None:
+        return None, "the event names no base commit"
+    if not fetched(git, base):
+        return None, git.said(f"the base commit {base[:12]} could not be fetched")
+    tip, made_on, is_pull = checkout_of(git, pull, base)
+    if tip is None:
+        return None, git.said("git could not read the checked-out commit")
+    if not fetched(git, tip):
+        return None, git.said(f"the head commit {tip[:12]} could not be fetched")
+    if made_on is not None and not fetched(git, made_on):
+        return None, git.said(f"the commit the test merge was made on, {made_on[:12]}, could not be fetched")
+    lefts = merge_bases(git, base, tip)
+    if not lefts:
+        return None, git.said(f"git found no commit where the branch left {base[:12]}")
+    pairs = [(left, tip) for left in lefts] + ([(made_on, "HEAD")] if made_on is not None else [])
+    diffs = [git("diff", "--no-renames", "--raw", "-z", older, newer) for older, newer in pairs]
+    if any(d is None for d in diffs):
+        return None, git.said(f"git could not compare {base[:12]} with the checkout")
+    away = "" if is_pull else (f"the checkout is neither the head the event names, {tip[:12]}, nor GitHub's test "
+                               f"merge of it, so the claim file looked for there is not the pull request's")
+    return diffs, away
+
+
+def changed_claims_in(root, pull):
+    """The issues whose claim files the pull request adds or changes and
+    the problems of what it does to the claim folder, read from the
+    checkout (change_of), as (numbers, problems): ((), []) where root holds
+    no .git, as a test's scratch folder does, where nothing is judged;
+    and where it holds one, every problem, a reason the change could not
+    be read among them, since a claim file the check cannot see may be the
+    one it is there to stop (F31 and its reviews): git missing or refusing
+    the checkout, a checkout whose top is another folder, a base or head
+    that cannot be fetched, a branch whose merge base is never found, or a
+    checkout that is not the pull request."""
+    if not (Path(root) / ".git").exists():
+        return (), []
+    git = Git(root)
+    top = git("rev-parse", "--show-toplevel")
+    if top is None:
+        return (), [UNREAD + git.said("git is missing or will not read the checkout")]
+    if Path(os.fsdecode(top.strip())).resolve() != Path(root).resolve():
+        return (), [UNREAD + f"the checkout's top is {os.fsdecode(top.strip())}, not the folder the check runs in"]
+    diffs, why = change_of(git, pull)
+    if diffs is None:
+        return (), [UNREAD + why]
+    numbers = sorted({n for diff in diffs for n in protocol_check.claim_files_changed(diff)})
+    problems = list(dict.fromkeys(p for diff in diffs for p in protocol_check.claim_folder_problems(diff)))
+    return tuple(numbers), problems + ([why] if why else [])
+
+
 def run_check(argv, environ=None, root="."):
     """The protocol check: a run outside a pull request event passes, so
     the check never breaks a push build; the claim file is looked for in
-    the checkout, root."""
+    the checkout, root, and the claim files the pull request adds or
+    changes are read from it with git (changed_claims_in)."""
     argparse.ArgumentParser(
         prog=f"{PROG} check",
         description="Hold the claude/<issue> pull request in GITHUB_EVENT_PATH to the claim protocol.",
@@ -238,8 +478,11 @@ def run_check(argv, environ=None, root="."):
     if event is None:
         print(why_not)
         return 0
+    pull = event.get("pull_request") or {}
+    changed, unread = changed_claims_in(root, pull) if pull else ((), [])
     problems = protocol_check.problems_for(
-        event.get("pull_request") or {}, lambda number: (Path(root) / claims.claim_path(number)).is_file())
+        pull, lambda number: (Path(root) / claims.claim_path(number)).is_file(), changed)
+    problems += unread
     for problem in problems:
         print(problem)
     if problems:
@@ -461,6 +704,199 @@ def run_guard(argv, stdin=None):
     return code
 
 
+locks = git_locks = None  # bound by run_locks
+
+
+# --- locks --------------------------------------------------------------------
+
+def locks_arguments(argv):
+    parser = argparse.ArgumentParser(
+        prog=f"{PROG} locks",
+        description="Locks on files, symbols and named resources, kept in LOCKS.json on the branch locks "
+                    "(sdlc_protocol.locks). verify obeys the switch SYMPHONY_LOCKS or .github/symphony-locks "
+                    "(off, advise, enforce); the other commands do what they are asked.")
+    parser.add_argument("--repo", default=".", help="the clone to work in")
+    parser.add_argument("--remote", default="origin")
+    parser.add_argument("--default-branch", default="main")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status", help="the table, one entry a line")
+    planning = sub.add_parser("plan", help="what a claim asks for to change KEYS: a write on each, reads on "
+                                           "what each Python symbol's code depends on")
+    planning.add_argument("keys", nargs="+", metavar="KEY")
+    acquiring = sub.add_parser("acquire", help="take KEYS for --claim, all or none")
+    acquiring.add_argument("keys", nargs="+", metavar="KEY")
+    acquiring.add_argument("--claim", type=int, required=True)
+    acquiring.add_argument("--worker", default="")
+    acquiring.add_argument("--read", action="append", default=[], metavar="KEY", help="a read lock as well")
+    acquiring.add_argument("--no-reads", action="store_true", help="take no read locks from the plan")
+    acquiring.add_argument("--with-claim", action="store_true",
+                           help="push the local branch claude/<claim> in the same atomic push: the claim itself")
+    releasing = sub.add_parser("release", help="give up every lock of --claim")
+    releasing.add_argument("--claim", type=int, required=True)
+    sweeping = sub.add_parser("sweep", help="drop the locks of claims that have ended")
+    sweeping.add_argument("--ended", type=int, action="append", default=[], metavar="N",
+                          help="a claim the caller knows has ended (its issue closed, its release counted)")
+    verifying = sub.add_parser("verify", help="hold the change from --base to --head to the locks: what it "
+                                              "touches that another claim holds, and, for a claim, what it "
+                                              "touches without holding it")
+    verifying.add_argument("--base", required=True)
+    verifying.add_argument("--head", default="HEAD")
+    verifying.add_argument("--claim", type=int, default=0, help="the claim's issue, 0 for a pull request of none")
+    overlapping = sub.add_parser("overlap", help="whether what the default branch --base changed since the "
+                                                 "change's fork meets what --head changes or builds on, so the "
+                                                 "change must bring main in; no lock table is read")
+    overlapping.add_argument("--base", required=True)
+    overlapping.add_argument("--head", default="HEAD")
+    return parser.parse_args(argv)
+
+
+def entry_line(entry):
+    return f"{entry.key}\t{entry.mode}\t#{entry.claim}\t{entry.worker or 'unnamed'}"
+
+
+def locks_status(args):
+    _, entries = git_locks.fetch_table(args.repo, args.remote)
+    print("\n".join(entry_line(entry) for entry in entries) or "no locks")
+    return 0
+
+
+def tracked_files(repo):
+    listed = subprocess.run(["git", "ls-files", "-z"], cwd=repo, capture_output=True, text=True)
+    return [name for name in listed.stdout.split("\0") if name]
+
+
+def file_reader(repo):
+    def read(path):
+        try:
+            return (Path(repo) / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+    return read
+
+
+def planned(args, claim=0, worker=""):
+    return locks.plan(args.keys, file_reader(args.repo), tracked_files(args.repo), claim, worker)
+
+
+def locks_plan(args):
+    print("\n".join(entry_line(entry) for entry in planned(args)))
+    return 0
+
+
+def locks_acquire(args):
+    wanted = planned(args, args.claim, args.worker)
+    if args.no_reads:
+        wanted = [entry for entry in wanted if entry.mode == locks.WRITE]
+    wanted += [locks.Entry(key, args.claim, locks.READ, args.worker) for key in args.read]
+    branch = claims.branch_of(args.claim) if args.with_claim else ""
+    after = git_locks.acquire(args.repo, args.remote, wanted, args.default_branch, branch)
+    print("\n".join(entry_line(entry) for entry in locks.held_by(after, args.claim)))
+    return 0
+
+
+def locks_release(args):
+    git_locks.release(args.repo, args.remote, args.claim, args.default_branch)
+    print(f"#{args.claim} holds no locks")
+    return 0
+
+
+def locks_sweep(args):
+    after = git_locks.sweep(args.repo, args.remote, args.default_branch, args.ended)
+    print(f"{len(after)} locks held")
+    return 0
+
+
+def switch_text(repo):
+    try:
+        return (Path(repo) / locks.SWITCH_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def locks_verify(args, environ):
+    mode = locks.mode_of(environ, switch_text(args.repo))
+    if mode == locks.OFF:
+        print("locks are off")
+        return 0
+    try:
+        problems = verify_problems(args)
+    except git_locks.LocksFailed as problem:
+        # At advise nothing fails, a clone too shallow to read included:
+        # actions/checkout's default depth must not turn a run red.
+        print(f"locks: {problem}")
+        return 1 if mode == locks.ENFORCE else 0
+    for line in problems:
+        print(f"locks: {line}")
+    if not problems:
+        print("locks: the change touches nothing it may not")
+    return 1 if problems and mode == locks.ENFORCE else 0
+
+
+def locks_overlap(args, environ):
+    mode = locks.mode_of(environ, switch_text(args.repo))
+    if mode == locks.OFF:
+        print("locks are off")
+        return 0
+    try:
+        met = git_locks.overlap(args.repo, args.base, args.head)
+    except git_locks.LocksFailed as problem:
+        print(f"locks: {problem}")
+        return 1 if mode == locks.ENFORCE else 0
+    for ours, theirs in met:
+        print(f"locks: {meeting_line(args.base, ours, theirs)}: bring {args.base} in")
+    if not met:
+        print(f"locks: nothing {args.base} changed since the base meets this change; it need not bring it in")
+    return 1 if met and mode == locks.ENFORCE else 0
+
+
+def meeting_line(base, ours, theirs):
+    """Why a change must bring the default branch in: what each side did
+    to the key, edited it or built on it, since a read on either side
+    means that side changed something that depends on the key."""
+    did = "edited" if theirs.mode == locks.WRITE else "built on"
+    does = "edits" if ours.mode == locks.WRITE else "builds on"
+    return f"{base} {did} {theirs.key} since this change's base, which this change {does}"
+
+
+def verify_problems(args):
+    _, entries = git_locks.fetch_table(args.repo, args.remote)
+    numbers = {entry.claim for entry in entries} - {args.claim}
+    alive = git_locks.live_claims(args.repo, args.remote, numbers, args.default_branch)
+    held = [entry for entry in entries if entry.claim in alive or entry.claim == args.claim]
+    touched = git_locks.touched(args.repo, args.base, args.head)
+    problems = [f"{want.key} is held by #{other.claim} ({other.worker or 'unnamed'}, {other.mode})"
+                for want, other in locks.conflicts(held, [locks.Entry(key, args.claim) for key in touched])]
+    if args.claim:
+        # A file the change adds, its own claim file among them, was no one
+        # else's to edit; another claim that means to add it holds it, and
+        # the conflicts above say so.
+        new = set(git_locks.added(args.repo, args.base, args.head))
+        problems += [f"{key} is changed but #{args.claim} holds no write lock on it"
+                     for key in locks.uncovered(touched, held, args.claim) if locks.split_key(key)[0] not in new]
+    return problems
+
+
+def run_locks(argv, environ=None):
+    # Imported here, as the GitHub adapter is, so the guard, which answers
+    # before every Bash call, never pays for ast and the git side.
+    global locks, git_locks
+    from . import locks
+    from .adapters import git_locks
+    args = locks_arguments(argv)
+    environ = os.environ if environ is None else environ
+    commands = {"status": locks_status, "plan": locks_plan, "acquire": locks_acquire, "release": locks_release,
+                "sweep": locks_sweep, "verify": lambda given: locks_verify(given, environ),
+                "overlap": lambda given: locks_overlap(given, environ)}
+    try:
+        return commands[args.command](args)
+    except locks.Held as problem:
+        print(f"locks: refused: {problem}", file=sys.stderr)
+        return 1
+    except (git_locks.LocksFailed, git_locks.ClaimTaken) as problem:
+        print(f"locks: {problem}", file=sys.stderr)
+        return 1
+
+
 # --- verify-vendored ----------------------------------------------------------
 
 def run_verify_vendored(argv):
@@ -474,7 +910,7 @@ def run_verify_vendored(argv):
 
 
 COMMANDS = {"board": run_board, "check": run_check, "team": run_team, "workers": run_workers, "guard": run_guard,
-            "verify-vendored": run_verify_vendored}
+            "locks": run_locks, "verify-vendored": run_verify_vendored}
 
 
 def main(argv=None):
